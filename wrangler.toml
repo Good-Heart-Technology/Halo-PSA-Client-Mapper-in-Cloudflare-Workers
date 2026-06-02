@@ -1,0 +1,18 @@
+name = "halo-psa-client-mapper"
+main = "src/worker.ts"
+compatibility_date = "2025-08-05"
+
+# Optional: add a custom domain route when ready
+# [[routes]]
+# pattern = "map.yourdomain.com"
+# custom_domain = true
+
+[vars]
+APP_NAME = "Halo Client & Agent Map"
+
+# Set via Cloudflare secrets (never commit real values):
+#   wrangler secret put HALO_CLIENT_ID
+#   wrangler secret put HALO_CLIENT_SECRET
+#   wrangler secret put HALO_BASE_URL
+# Optional tenant for hosted Halo (infer from URL host if omitted):
+#   wrangler secret put HALO_TENANT

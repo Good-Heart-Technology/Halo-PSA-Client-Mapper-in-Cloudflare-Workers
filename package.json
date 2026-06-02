@@ -1,0 +1,18 @@
+{
+  "name": "halo-psa-client-mapper-in-cloudflare-workers",
+  "version": "1.0.0",
+  "description": "Map Halo PSA agents and client organizations by address",
+  "main": "src/worker.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "wrangler check"
+  },
+  "author": "Good Heart Tech",
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
