@@ -79,19 +79,19 @@ export default {
       }
     }
 
-    if (request.method === "GET" && url.pathname === "/api/agent-photo") {
+    if (request.method === "GET" && (url.pathname === "/api/halo-image" || url.pathname === "/api/agent-photo")) {
       const photoPath = url.searchParams.get("path");
-      if (!photoPath || !photoPath.startsWith("/AgentImage/")) {
+      if (!photoPath || !isAllowedHaloImagePath(photoPath)) {
         return new Response("Invalid path", { status: 400 });
       }
       try {
         const token = await getHaloToken(env);
-        const imageUrl = joinUrl(env.HALO_BASE_URL, `/api${photoPath}`);
+        const imageUrl = resolveHaloImageUrl(env.HALO_BASE_URL, photoPath);
         const image = await fetch(imageUrl, {
           headers: { Authorization: `Bearer ${token}` }
         });
         if (!image.ok) {
-          return new Response("Photo not found", { status: image.status });
+          return new Response("Image not found", { status: image.status });
         }
         return new Response(image.body, {
           headers: {
@@ -100,7 +100,7 @@ export default {
           }
         });
       } catch {
-        return new Response("Photo fetch failed", { status: 500 });
+        return new Response("Image fetch failed", { status: 500 });
       }
     }
 
@@ -286,7 +286,7 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
       ...(coords ? { lat: coords.lat, lng: coords.lng } : {})
     };
     if (agent.agentphotopath) {
-      point.photoUrl = `/api/agent-photo?path=${encodeURIComponent(agent.agentphotopath)}`;
+      point.photoUrl = haloImageProxyUrl(agent.agentphotopath);
     }
     agents.push(point);
   }
@@ -440,6 +440,8 @@ interface HaloClient {
   main_site_id?: number;
   main_delivery_address?: AddressStore;
   customfields?: HaloCustomField[];
+  /** Full URL or path to logo on Halo (often /api/attachment/image/{id}). */
+  logo?: string | null;
 }
 
 interface HaloSite {
@@ -700,6 +702,7 @@ function buildOrganizations(
 
   const points: MapPoint[] = [];
   let noAddress = 0;
+  let withLogo = 0;
   for (const client of clients) {
     if (client.inactive) continue;
     const name = client.name || `Client ${client.id}`;
@@ -722,14 +725,18 @@ function buildOrganizations(
     }
 
     const coords = coordsFromStore(store);
+    const logoProxy = clientLogoProxyUrl(client.logo);
+    if (logoProxy) withLogo++;
     points.push({
       id: client.id,
       name,
       address: addressText,
       siteName,
+      ...(logoProxy ? { photoUrl: logoProxy } : {}),
       ...(coords ? { lat: coords.lat, lng: coords.lng } : {})
     });
   }
+  log("info", `Organizations with Halo logo: ${withLogo} of ${points.length} mapped`);
   if (noAddress > 0) {
     log(
       "warn",
@@ -835,6 +842,43 @@ function trimSlash(url: string): string {
 function joinUrl(base: string, path: string): string {
   const b = trimSlash(base);
   return path.startsWith("/") ? `${b}${path}` : `${b}/${path}`;
+}
+
+function isAllowedHaloImagePath(path: string): boolean {
+  return (
+    path.startsWith("/AgentImage/") ||
+    path.startsWith("/api/attachment/image/") ||
+    path.startsWith("/attachment/image/")
+  );
+}
+
+function resolveHaloImageUrl(base: string, path: string): string {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  if (p.startsWith("/api/")) return joinUrl(base, p);
+  return joinUrl(base, `/api${p}`);
+}
+
+function haloImageProxyUrl(haloPathOrUrl: string): string | undefined {
+  const path = normalizeHaloImagePath(haloPathOrUrl);
+  if (!path || !isAllowedHaloImagePath(path)) return undefined;
+  return `/api/halo-image?path=${encodeURIComponent(path)}`;
+}
+
+function normalizeHaloImagePath(value: string): string | undefined {
+  const raw = value.trim();
+  if (!raw) return undefined;
+  if (raw.startsWith("/")) return raw;
+  try {
+    const u = new URL(raw);
+    return u.pathname + u.search;
+  } catch {
+    return undefined;
+  }
+}
+
+function clientLogoProxyUrl(logo: string | null | undefined): string | undefined {
+  if (!logo?.trim()) return undefined;
+  return haloImageProxyUrl(logo);
 }
 
 function inferTenant(baseUrl: string): string | undefined {
@@ -1008,6 +1052,11 @@ function getPageHtml(title: string): string {
       margin-bottom: 6px;
       border: 2px solid #30363d;
     }
+    .tip-photo.org-logo {
+      border-radius: 8px;
+      object-fit: contain;
+      background: #fff;
+    }
     .agent-marker {
       background: #58a6ff;
       border: 2px solid #fff;
@@ -1076,8 +1125,9 @@ function getPageHtml(title: string): string {
     }
 
     function tooltipHtml(point, kind) {
+      const photoClass = kind === "Organization" ? "tip-photo org-logo" : "tip-photo";
       const photo = point.photoUrl
-        ? '<img class="tip-photo" src="' + point.photoUrl + '" alt="" />'
+        ? '<img class="' + photoClass + '" src="' + point.photoUrl + '" alt="" />'
         : "";
       const site = point.siteName
         ? '<div class="tip-addr">' + escapeHtml(point.siteName) + "</div>"
