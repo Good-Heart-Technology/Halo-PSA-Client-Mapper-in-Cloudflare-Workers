@@ -15,3 +15,5 @@ APP_NAME = "Halo Client & Agent Map"
 #   wrangler secret put HALO_BASE_URL
 # Optional tenant for hosted Halo (infer from URL host if omitted):
 #   wrangler secret put HALO_TENANT
+# Optional agent mailing-address custom field id (Halo PSA → custom field id):
+#   wrangler secret put HALO_AGENT_ADDRESS_FIELD_ID

@@ -3,6 +3,8 @@ interface Env {
   HALO_CLIENT_SECRET: string;
   HALO_BASE_URL: string;
   HALO_TENANT?: string;
+  /** Optional Halo custom field id for agent mailing address (include_custom_fields). */
+  HALO_AGENT_ADDRESS_FIELD_ID?: string;
   APP_NAME?: string;
 }
 
@@ -26,15 +28,25 @@ interface MapPoint {
   siteName?: string;
 }
 
+interface DebugLog {
+  at: string;
+  level: "info" | "warn" | "error";
+  message: string;
+}
+
 interface MapDataResponse {
   agents: MapPoint[];
   organizations: MapPoint[];
   stats: {
     agentsTotal: number;
     agentsMapped: number;
+    agentsWithAddress: number;
     organizationsTotal: number;
     organizationsMapped: number;
+    sitesTotal: number;
+    sitesWithAddress: number;
   };
+  debug: DebugLog[];
 }
 
 let tokenCache: { token: string; expires: number } | null = null;
@@ -53,7 +65,7 @@ export default {
         return jsonResponse(data);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
-        return jsonResponse({ error: message }, 500);
+        return jsonResponse(emptyMapDataResponse(message), 500);
       }
     }
 
@@ -86,21 +98,56 @@ export default {
   }
 };
 
-async function buildMapData(env: Env): Promise<MapDataResponse> {
-  const token = await getHaloToken(env);
-  const base = trimSlash(env.HALO_BASE_URL);
+function emptyMapDataResponse(errorMessage: string): MapDataResponse {
+  return {
+    agents: [],
+    organizations: [],
+    stats: {
+      agentsTotal: 0,
+      agentsMapped: 0,
+      agentsWithAddress: 0,
+      organizationsTotal: 0,
+      organizationsMapped: 0,
+      sitesTotal: 0,
+      sitesWithAddress: 0
+    },
+    debug: [{ at: new Date().toISOString(), level: "error", message: errorMessage }]
+  };
+}
 
-  // Halo: 3 list calls (agents, clients, sites). Geocoding runs in the browser.
+function createDebugLog(): { logs: DebugLog[]; log: (level: DebugLog["level"], message: string) => void } {
+  const logs: DebugLog[] = [];
+  return {
+    logs,
+    log(level, message) {
+      logs.push({ at: new Date().toISOString(), level, message });
+    }
+  };
+}
+
+async function buildMapData(env: Env): Promise<MapDataResponse> {
+  const { logs, log } = createDebugLog();
+  const base = trimSlash(env.HALO_BASE_URL);
+  log("info", `Halo base URL host: ${safeHost(base)}`);
+
+  const token = await getHaloToken(env, log);
+
   const [agentsRaw, clientsRaw, sitesRaw] = await Promise.all([
-    fetchAllAgents(base, token),
-    fetchAllClients(base, token),
-    fetchAllSites(base, token)
+    fetchAllAgents(base, token, log, env),
+    fetchAllClients(base, token, log),
+    fetchAllSites(base, token, log)
   ]);
 
   const agents: MapPoint[] = [];
+  let agentsWithAddress = 0;
+  let agentsNoAddress = 0;
   for (const agent of agentsRaw) {
     const addressText = agentAddressText(agent);
-    if (!addressText) continue;
+    if (!addressText) {
+      agentsNoAddress++;
+      continue;
+    }
+    agentsWithAddress++;
     const coords = coordsFromStore(agent.main_delivery_address);
     const point: MapPoint = {
       id: agent.id,
@@ -113,8 +160,15 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
     }
     agents.push(point);
   }
+  if (agentsNoAddress > 0) {
+    log("warn", `${agentsNoAddress} agent(s) skipped — no mailing/address custom field on list response`);
+  }
+  log("info", `Agents with address text: ${agentsWithAddress} → ${agents.length} map entries`);
 
-  const organizations = buildOrganizations(clientsRaw, sitesRaw);
+  const sitesWithAddress = sitesRaw.filter(
+    (s) => addressStoreToText(s.delivery_address) || addressStoreToText(s.invoice_address)
+  ).length;
+  const organizations = buildOrganizations(clientsRaw, sitesRaw, log);
 
   return {
     agents,
@@ -122,16 +176,32 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
     stats: {
       agentsTotal: agentsRaw.length,
       agentsMapped: agents.length,
+      agentsWithAddress,
       organizationsTotal: clientsRaw.length,
-      organizationsMapped: organizations.length
-    }
+      organizationsMapped: organizations.length,
+      sitesTotal: sitesRaw.length,
+      sitesWithAddress
+    },
+    debug: logs
   };
+}
+
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "(invalid URL)";
+  }
 }
 
 // --- Halo auth & HTTP ---
 
-async function getHaloToken(env: Env): Promise<string> {
+async function getHaloToken(
+  env: Env,
+  log?: (level: DebugLog["level"], message: string) => void
+): Promise<string> {
   if (tokenCache && Date.now() < tokenCache.expires) {
+    log?.("info", "Using cached Halo OAuth token");
     return tokenCache.token;
   }
 
@@ -140,6 +210,7 @@ async function getHaloToken(env: Env): Promise<string> {
   const tokenUrls = [`${base}/auth/token`];
   if (tenant) {
     tokenUrls.push(`${base}/token?tenant=${encodeURIComponent(tenant)}`);
+    log?.("info", `OAuth tenant: ${tenant}`);
   }
 
   const body = new URLSearchParams({
@@ -161,12 +232,14 @@ async function getHaloToken(env: Env): Promise<string> {
     });
     const text = await response.text();
     if (!response.ok) {
-      lastError = `Token ${response.status}`;
+      lastError = `Token ${response.status} ${response.statusText}`;
+      log?.("warn", `Token failed: ${tokenUrl} → ${lastError}`);
       continue;
     }
     const data = JSON.parse(text) as { access_token?: string; expires_in?: number };
     if (!data.access_token) {
       lastError = "Token response missing access_token";
+      log?.("warn", `Token missing access_token from ${tokenUrl}`);
       continue;
     }
     const expiresIn = data.expires_in ?? 3600;
@@ -174,19 +247,37 @@ async function getHaloToken(env: Env): Promise<string> {
       token: data.access_token,
       expires: Date.now() + (expiresIn - 120) * 1000
     };
+    log?.("info", `Halo OAuth token obtained (expires in ~${expiresIn}s)`);
     return data.access_token;
   }
+  log?.("error", lastError);
   throw new Error(lastError);
 }
 
-async function haloGet<T>(base: string, token: string, path: string): Promise<T> {
+async function haloGet(
+  base: string,
+  token: string,
+  path: string
+): Promise<{ ok: true; data: unknown } | { ok: false; status: number; statusText: string; body: string }> {
   const response = await fetch(joinUrl(base, path), {
     headers: { Accept: "application/json", Authorization: `Bearer ${token}` }
   });
+  const body = await response.text();
   if (!response.ok) {
-    throw new Error(`Halo GET ${path} failed: ${response.status}`);
+    return {
+      ok: false,
+      status: response.status,
+      statusText: response.statusText,
+      body: body.slice(0, 300)
+    };
   }
-  return response.json() as Promise<T>;
+  let data: unknown;
+  try {
+    data = body ? JSON.parse(body) : null;
+  } catch {
+    return { ok: false, status: response.status, statusText: "Invalid JSON", body: body.slice(0, 300) };
+  }
+  return { ok: true, data };
 }
 
 // --- Halo data fetch ---
@@ -227,56 +318,187 @@ interface HaloSite {
   invoice_address?: AddressStore;
 }
 
-/** One Halo list request; uses count (no pagination) when the API allows it. */
+const LIST_KEYS: Record<"Agent" | "Client" | "Site", string[]> = {
+  Agent: ["agents", "agent", "uname"],
+  Client: ["clients", "client", "areas", "area"],
+  Site: ["sites", "site"]
+};
+
+function extractHaloList<T>(data: unknown, resource: "Agent" | "Client" | "Site"): T[] {
+  if (Array.isArray(data)) return data as T[];
+  if (!data || typeof data !== "object") return [];
+  const record = data as Record<string, unknown>;
+  for (const key of LIST_KEYS[resource]) {
+    const value = record[key];
+    if (Array.isArray(value)) return value as T[];
+  }
+  return [];
+}
+
+function describeHaloShape(data: unknown): string {
+  if (Array.isArray(data)) return `array[${data.length}]`;
+  if (!data || typeof data !== "object") return String(data);
+  const keys = Object.keys(data as object);
+  const parts = keys.slice(0, 8).map((k) => {
+    const v = (data as Record<string, unknown>)[k];
+    return Array.isArray(v) ? `${k}[${v.length}]` : k;
+  });
+  return `{ ${parts.join(", ")} }`;
+}
+
+/** One Halo list request. */
 async function fetchHaloList<T>(
   base: string,
   token: string,
   resource: "Agent" | "Client" | "Site",
-  params: Record<string, string>
+  params: Record<string, string>,
+  log: (level: DebugLog["level"], message: string) => void
 ): Promise<T[]> {
   const query = new URLSearchParams(params);
-  const batch = await haloGet<T[] | Record<string, T[]>>(
-    base,
-    token,
-    `/api/${resource}?${query}`
+  const path = `/api/${resource}?${query}`;
+  const result = await haloGet(base, token, path);
+  if (!result.ok) {
+    log("error", `GET ${path} → ${result.status} ${result.statusText}`);
+    if (result.body) log("error", `Body: ${result.body}`);
+    return [];
+  }
+  const list = extractHaloList<T>(result.data, resource);
+  log(
+    "info",
+    `GET ${resource}?${query} → ${list.length} rows (shape: ${describeHaloShape(result.data)})`
   );
-  if (Array.isArray(batch)) return batch;
-  const key = resource === "Agent" ? "agents" : resource === "Client" ? "clients" : "sites";
-  return (batch as Record<string, T[]>)[key] ?? [];
+  return list;
 }
 
-async function fetchAllAgents(base: string, token: string): Promise<HaloAgent[]> {
-  const query: Record<string, string> = {
-    includeactive: "true",
-    includeinactive: "false",
+async function fetchAllAgents(
+  base: string,
+  token: string,
+  log: (level: DebugLog["level"], message: string) => void,
+  env: Env
+): Promise<HaloAgent[]> {
+  const params: Record<string, string> = {
+    activeinactive: "true,false",
     includedetails: "true",
+    pageinate: "true",
     page_size: "500",
     page_no: "1"
   };
-  const list = await fetchHaloList<HaloAgent>(base, token, "Agent", query);
-  return list.filter(
-    (agent) => agent.is_agent && !agent.isdisabled && agent.name !== "Unassigned"
+  if (env.HALO_AGENT_ADDRESS_FIELD_ID?.trim()) {
+    params.include_custom_fields = env.HALO_AGENT_ADDRESS_FIELD_ID.trim();
+    log("info", `Agent include_custom_fields=${params.include_custom_fields}`);
+  }
+  let list = await fetchHaloList<HaloAgent>(base, token, "Agent", params, log);
+
+  if (list.length === 0) {
+    log("warn", "Agent list empty — retrying with includeactive/includeinactive");
+    list = await fetchHaloList<HaloAgent>(
+      base,
+      token,
+      "Agent",
+      {
+        includeactive: "true",
+        includeinactive: "false",
+        includedetails: "true",
+        page_size: "500",
+        page_no: "1"
+      },
+      log
+    );
+  }
+
+  const before = list.length;
+  const filtered = list.filter(isActiveAgent);
+  log(
+    "info",
+    `Agents after filter: ${filtered.length} of ${before} (drop Unassigned/disabled/non-agent)`
   );
+  if (filtered.length === 0 && before > 0) {
+    const sample = list.slice(0, 3).map((a) => `${a.name}(is_agent=${a.is_agent})`).join(", ");
+    log("warn", `Sample unfiltered agents: ${sample}`);
+  }
+  return filtered;
 }
 
-async function fetchAllClients(base: string, token: string): Promise<HaloClient[]> {
-  return fetchHaloList<HaloClient>(base, token, "Client", {
-    includeactive: "true",
-    includeinactive: "false",
-    count: "5000"
-  });
+function isActiveAgent(agent: HaloAgent): boolean {
+  if (agent.name === "Unassigned") return false;
+  if (agent.isdisabled) return false;
+  if (agent.is_agent === false) return false;
+  return true;
 }
 
-async function fetchAllSites(base: string, token: string): Promise<HaloSite[]> {
-  return fetchHaloList<HaloSite>(base, token, "Site", {
-    includeactive: "true",
-    includeinactive: "false",
-    includeaddress: "true",
-    count: "5000"
-  });
+async function fetchAllClients(
+  base: string,
+  token: string,
+  log: (level: DebugLog["level"], message: string) => void
+): Promise<HaloClient[]> {
+  let list = await fetchHaloList<HaloClient>(
+    base,
+    token,
+    "Client",
+    { includeactive: "true", includeinactive: "false", count: "5000" },
+    log
+  );
+  if (list.length === 0) {
+    log("warn", "Client list empty with count=5000 — retrying paginated");
+    list = await fetchHaloList<HaloClient>(
+      base,
+      token,
+      "Client",
+      {
+        includeactive: "true",
+        includeinactive: "false",
+        pageinate: "true",
+        page_size: "100",
+        page_no: "1"
+      },
+      log
+    );
+  }
+  return list.filter((c) => !c.inactive);
 }
 
-function buildOrganizations(clients: HaloClient[], sites: HaloSite[]): MapPoint[] {
+async function fetchAllSites(
+  base: string,
+  token: string,
+  log: (level: DebugLog["level"], message: string) => void
+): Promise<HaloSite[]> {
+  let list = await fetchHaloList<HaloSite>(
+    base,
+    token,
+    "Site",
+    {
+      includeactive: "true",
+      includeinactive: "false",
+      includeaddress: "true",
+      count: "5000"
+    },
+    log
+  );
+  if (list.length === 0) {
+    log("warn", "Site list empty with count=5000 — retrying paginated");
+    list = await fetchHaloList<HaloSite>(
+      base,
+      token,
+      "Site",
+      {
+        includeactive: "true",
+        includeinactive: "false",
+        includeaddress: "true",
+        pageinate: "true",
+        page_size: "100",
+        page_no: "1"
+      },
+      log
+    );
+  }
+  return list;
+}
+
+function buildOrganizations(
+  clients: HaloClient[],
+  sites: HaloSite[],
+  log: (level: DebugLog["level"], message: string) => void
+): MapPoint[] {
   const sitePick = new Map<number, { score: number; siteName?: string; text: string; store?: AddressStore }>();
 
   for (const site of sites) {
@@ -292,7 +514,10 @@ function buildOrganizations(clients: HaloClient[], sites: HaloSite[]): MapPoint[
     }
   }
 
+  log("info", `Site address index: ${sitePick.size} client(s) with a site address`);
+
   const points: MapPoint[] = [];
+  let noAddress = 0;
   for (const client of clients) {
     if (client.inactive) continue;
     const name = client.name || `Client ${client.id}`;
@@ -309,7 +534,10 @@ function buildOrganizations(clients: HaloClient[], sites: HaloSite[]): MapPoint[
       }
     }
     if (!addressText) addressText = customFieldAddress(client.customfields);
-    if (!addressText) continue;
+    if (!addressText) {
+      noAddress++;
+      continue;
+    }
 
     const coords = coordsFromStore(store);
     points.push({
@@ -320,6 +548,13 @@ function buildOrganizations(clients: HaloClient[], sites: HaloSite[]): MapPoint[
       ...(coords ? { lat: coords.lat, lng: coords.lng } : {})
     });
   }
+  if (noAddress > 0) {
+    log(
+      "warn",
+      `${noAddress} org(s) have no address (need site delivery_address or client custom field on list API)`
+    );
+  }
+  log("info", `Organizations with address text: ${points.length}`);
   return points;
 }
 
@@ -453,7 +688,35 @@ function getPageHtml(title: string): string {
       font-size: 0.85rem;
       color: #8b949e;
     }
+    .tabs { display: flex; gap: 4px; }
+    .tab {
+      padding: 6px 12px;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      background: #21262d;
+      color: #8b949e;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    .tab.active { background: #30363d; color: #e7ecf3; border-color: #58a6ff; }
+    .panel { display: none; flex: 1; min-height: 0; flex-direction: column; }
+    .panel.active { display: flex; }
     #map { flex: 1; min-height: 0; background: #0d1117; }
+    #debugPanel {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 12px 16px;
+      background: #0d1117;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }
+    .log-line { margin-bottom: 6px; word-break: break-word; }
+    .log-line.info { color: #8b949e; }
+    .log-line.warn { color: #d29922; }
+    .log-line.error { color: #f85149; }
+    .log-time { color: #484f58; margin-right: 8px; }
     #status {
       padding: 8px 16px;
       font-size: 0.85rem;
@@ -500,13 +763,22 @@ function getPageHtml(title: string): string {
 <body>
   <header>
     <h1>${escapeHtml(title)}</h1>
-    <div class="toggles">
+    <div class="tabs">
+      <button type="button" class="tab active" data-panel="mapPanel">Map</button>
+      <button type="button" class="tab" data-panel="debugPanel">Debug</button>
+    </div>
+    <div class="toggles map-only">
       <label class="toggle"><input type="checkbox" id="showAgents" checked /> Agents</label>
       <label class="toggle"><input type="checkbox" id="showOrgs" checked /> Organizations</label>
     </div>
     <div class="stats" id="stats">Loading…</div>
   </header>
-  <div id="map"></div>
+  <div id="mapPanel" class="panel active">
+    <div id="map"></div>
+  </div>
+  <div id="debugPanelWrap" class="panel">
+    <pre id="debugPanel">No debug output yet. Load map data first.</pre>
+  </div>
   <div id="status">Fetching Halo data…</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -631,13 +903,59 @@ function getPageHtml(title: string): string {
     document.getElementById("showAgents").addEventListener("change", updateVisibility);
     document.getElementById("showOrgs").addEventListener("change", updateVisibility);
 
+    function showPanel(panelId) {
+      document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
+      document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+      const panel = panelId === "debugPanel"
+        ? document.getElementById("debugPanelWrap")
+        : document.getElementById("mapPanel");
+      panel.classList.add("active");
+      document.querySelector('.tab[data-panel="' + panelId + '"]').classList.add("active");
+      document.querySelectorAll(".map-only").forEach((el) => {
+        el.style.display = panelId === "mapPanel" ? "" : "none";
+      });
+      if (panelId === "mapPanel") setTimeout(() => map.invalidateSize(), 50);
+    }
+
+    document.querySelectorAll(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => showPanel(tab.getAttribute("data-panel")));
+    });
+
+    function renderDebug(logs) {
+      const el = document.getElementById("debugPanel");
+      if (!logs || !logs.length) {
+        el.textContent = "No debug lines returned.";
+        return;
+      }
+      el.innerHTML = logs.map((line) => {
+        const t = line.at ? line.at.replace("T", " ").replace("Z", " UTC") : "";
+        return '<div class="log-line ' + escapeHtml(line.level) + '">' +
+          '<span class="log-time">' + escapeHtml(t) + "</span>" +
+          escapeHtml(line.message) + "</div>";
+      }).join("");
+    }
+
     async function load() {
       const status = document.getElementById("status");
       const statsEl = document.getElementById("stats");
       try {
         const res = await fetch("/api/map-data");
         const data = await res.json();
+        if (data.debug) renderDebug(data.debug);
         if (!res.ok) throw new Error(data.error || res.statusText);
+
+        const s = data.stats;
+        statsEl.textContent =
+          s.agentsTotal + " agents (" + s.agentsMapped + " w/ address) · " +
+          s.organizationsTotal + " orgs (" + s.organizationsMapped + " w/ address) · " +
+          s.sitesWithAddress + "/" + s.sitesTotal + " sites w/ address";
+
+        if (!data.agents.length && !data.organizations.length) {
+          status.textContent = "Halo returned no mappable addresses — open Debug tab for API details.";
+          status.classList.add("error");
+          showPanel("debugPanel");
+          return;
+        }
 
         status.textContent = "Geocoding addresses in browser (keeps Worker fast)…";
         const agentResult = await addMarkers(agentLayer, data.agents, "Agent", agentIcon, status);
@@ -648,16 +966,18 @@ function getPageHtml(title: string): string {
         const pinsOnMap = agentResult.geocoded + orgResult.geocoded;
         const skipped = agentResult.skipped + orgResult.skipped;
         statsEl.textContent =
-          agentResult.geocoded + "/" + data.stats.agentsMapped + " agents · " +
-          orgResult.geocoded + "/" + data.stats.organizationsMapped + " orgs on map";
+          pinsOnMap + " pins · " +
+          agentResult.geocoded + "/" + data.agents.length + " agents · " +
+          orgResult.geocoded + "/" + data.organizations.length + " orgs";
         status.textContent = pinsOnMap
-          ? "Ready — " + pinsOnMap + " pins" + (skipped ? " (" + skipped + " addresses could not be geocoded)" : "") + ". Hover for details."
-          : "No pins placed. Check that Halo has mailing addresses (agents) or site addresses (orgs).";
+          ? "Ready — " + pinsOnMap + " pins" + (skipped ? " (" + skipped + " could not be geocoded)" : "") + ". Hover for details."
+          : "Addresses found but geocoding failed — check Debug tab; Nominatim may be rate-limiting.";
         status.classList.remove("error");
       } catch (e) {
         status.textContent = "Error: " + (e.message || e);
         status.classList.add("error");
         statsEl.textContent = "";
+        showPanel("debugPanel");
       }
     }
 
