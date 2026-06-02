@@ -20,8 +20,8 @@ interface MapPoint {
   id: number;
   name: string;
   address: string;
-  lat: number;
-  lng: number;
+  lat?: number;
+  lng?: number;
   photoUrl?: string;
   siteName?: string;
 }
@@ -89,25 +89,24 @@ export default {
 async function buildMapData(env: Env): Promise<MapDataResponse> {
   const token = await getHaloToken(env);
   const base = trimSlash(env.HALO_BASE_URL);
-  const geocodeCache = new Map<string, { lat: number; lng: number } | null>();
 
-  const [agentsRaw, clientsRaw] = await Promise.all([
+  // Halo: 3 list calls (agents, clients, sites). Geocoding runs in the browser.
+  const [agentsRaw, clientsRaw, sitesRaw] = await Promise.all([
     fetchAllAgents(base, token),
-    fetchAllClients(base, token)
+    fetchAllClients(base, token),
+    fetchAllSites(base, token)
   ]);
 
   const agents: MapPoint[] = [];
   for (const agent of agentsRaw) {
     const addressText = agentAddressText(agent);
     if (!addressText) continue;
-    const coords = await resolveCoords(addressText, agent.main_delivery_address, geocodeCache);
-    if (!coords) continue;
+    const coords = coordsFromStore(agent.main_delivery_address);
     const point: MapPoint = {
       id: agent.id,
       name: agent.name || `Agent ${agent.id}`,
       address: addressText,
-      lat: coords.lat,
-      lng: coords.lng
+      ...(coords ? { lat: coords.lat, lng: coords.lng } : {})
     };
     if (agent.agentphotopath) {
       point.photoUrl = `/api/agent-photo?path=${encodeURIComponent(agent.agentphotopath)}`;
@@ -115,25 +114,7 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
     agents.push(point);
   }
 
-  const organizations: MapPoint[] = [];
-  const clientDetails = await fetchClientAddresses(base, token, clientsRaw);
-  for (const client of clientDetails) {
-    if (!client.addressText) continue;
-    const coords = await resolveCoords(
-      client.addressText,
-      client.addressStore,
-      geocodeCache
-    );
-    if (!coords) continue;
-    organizations.push({
-      id: client.id,
-      name: client.name,
-      address: client.addressText,
-      lat: coords.lat,
-      lng: coords.lng,
-      siteName: client.siteName
-    });
-  }
+  const organizations = buildOrganizations(clientsRaw, sitesRaw);
 
   return {
     agents,
@@ -227,138 +208,128 @@ interface HaloCustomField {
   value?: string;
 }
 
-interface HaloClientSummary {
+interface HaloClient {
   id: number;
   name?: string;
+  inactive?: boolean;
   main_site_id?: number;
+  main_delivery_address?: AddressStore;
+  customfields?: HaloCustomField[];
 }
 
-interface ClientAddressResult {
+interface HaloSite {
   id: number;
-  name: string;
-  addressText?: string;
-  addressStore?: AddressStore;
-  siteName?: string;
+  name?: string;
+  client_id?: number;
+  client_name?: string;
+  defaultdelivery?: boolean;
+  delivery_address?: AddressStore;
+  invoice_address?: AddressStore;
+}
+
+/** One Halo list request; uses count (no pagination) when the API allows it. */
+async function fetchHaloList<T>(
+  base: string,
+  token: string,
+  resource: "Agent" | "Client" | "Site",
+  params: Record<string, string>
+): Promise<T[]> {
+  const query = new URLSearchParams(params);
+  const batch = await haloGet<T[] | Record<string, T[]>>(
+    base,
+    token,
+    `/api/${resource}?${query}`
+  );
+  if (Array.isArray(batch)) return batch;
+  const key = resource === "Agent" ? "agents" : resource === "Client" ? "clients" : "sites";
+  return (batch as Record<string, T[]>)[key] ?? [];
 }
 
 async function fetchAllAgents(base: string, token: string): Promise<HaloAgent[]> {
-  const items: HaloAgent[] = [];
-  let page = 1;
-  const pageSize = 100;
+  const query: Record<string, string> = {
+    includeactive: "true",
+    includeinactive: "false",
+    includedetails: "true",
+    page_size: "500",
+    page_no: "1"
+  };
+  const list = await fetchHaloList<HaloAgent>(base, token, "Agent", query);
+  return list.filter(
+    (agent) => agent.is_agent && !agent.isdisabled && agent.name !== "Unassigned"
+  );
+}
 
-  while (page <= 50) {
-    const query = new URLSearchParams({
-      includeactive: "true",
-      includeinactive: "false",
-      includedetails: "true",
-      page_no: String(page),
-      page_size: String(pageSize)
-    });
-    const batch = await haloGet<HaloAgent[] | { agents?: HaloAgent[] }>(
-      base,
-      token,
-      `/api/Agent?${query}`
-    );
-    const list = Array.isArray(batch) ? batch : batch.agents ?? [];
-    if (list.length === 0) break;
-    for (const agent of list) {
-      if (!agent.is_agent) continue;
-      if (agent.isdisabled) continue;
-      if (agent.name === "Unassigned") continue;
-      items.push(agent);
+async function fetchAllClients(base: string, token: string): Promise<HaloClient[]> {
+  return fetchHaloList<HaloClient>(base, token, "Client", {
+    includeactive: "true",
+    includeinactive: "false",
+    count: "5000"
+  });
+}
+
+async function fetchAllSites(base: string, token: string): Promise<HaloSite[]> {
+  return fetchHaloList<HaloSite>(base, token, "Site", {
+    includeactive: "true",
+    includeinactive: "false",
+    includeaddress: "true",
+    count: "5000"
+  });
+}
+
+function buildOrganizations(clients: HaloClient[], sites: HaloSite[]): MapPoint[] {
+  const sitePick = new Map<number, { score: number; siteName?: string; text: string; store?: AddressStore }>();
+
+  for (const site of sites) {
+    const clientId = site.client_id != null ? Math.round(site.client_id) : 0;
+    if (!clientId) continue;
+    const store = site.delivery_address || site.invoice_address;
+    const text = addressStoreToText(store);
+    if (!text) continue;
+    const score = siteScore(site);
+    const existing = sitePick.get(clientId);
+    if (!existing || score > existing.score) {
+      sitePick.set(clientId, { score, siteName: site.name, text, store });
     }
-    if (list.length < pageSize) break;
-    page++;
   }
-  return items;
-}
 
-async function fetchAllClients(
-  base: string,
-  token: string
-): Promise<HaloClientSummary[]> {
-  const items: HaloClientSummary[] = [];
-  let page = 1;
-  const pageSize = 100;
+  const points: MapPoint[] = [];
+  for (const client of clients) {
+    if (client.inactive) continue;
+    const name = client.name || `Client ${client.id}`;
+    let addressText = addressStoreToText(client.main_delivery_address);
+    let store = client.main_delivery_address;
+    let siteName: string | undefined;
 
-  while (page <= 50) {
-    const query = new URLSearchParams({
-      includeactive: "true",
-      includeinactive: "false",
-      page_no: String(page),
-      page_size: String(pageSize)
+    const picked = sitePick.get(client.id);
+    if (picked) {
+      if (!addressText || picked.score >= 2) {
+        addressText = picked.text;
+        store = picked.store;
+        siteName = picked.siteName;
+      }
+    }
+    if (!addressText) addressText = customFieldAddress(client.customfields);
+    if (!addressText) continue;
+
+    const coords = coordsFromStore(store);
+    points.push({
+      id: client.id,
+      name,
+      address: addressText,
+      siteName,
+      ...(coords ? { lat: coords.lat, lng: coords.lng } : {})
     });
-    const batch = await haloGet<{ clients?: HaloClientSummary[] } | HaloClientSummary[]>(
-      base,
-      token,
-      `/api/Client?${query}`
-    );
-    const list = Array.isArray(batch) ? batch : batch.clients ?? [];
-    if (list.length === 0) break;
-    items.push(...list);
-    if (list.length < pageSize) break;
-    page++;
   }
-  return items;
+  return points;
 }
 
-async function fetchClientAddresses(
-  base: string,
-  token: string,
-  clients: HaloClientSummary[]
-): Promise<ClientAddressResult[]> {
-  const results: ClientAddressResult[] = [];
-  const chunkSize = 8;
-
-  for (let i = 0; i < clients.length; i += chunkSize) {
-    const chunk = clients.slice(i, i + chunkSize);
-    const settled = await Promise.all(
-      chunk.map(async (client) => {
-        const name = client.name || `Client ${client.id}`;
-        try {
-          const detail = await haloGet<{
-            main_delivery_address?: AddressStore;
-            main_site_id?: number;
-            customfields?: HaloCustomField[];
-          }>(base, token, `/api/Client/${client.id}?includedetails=true`);
-
-          let addressText = addressStoreToText(detail.main_delivery_address);
-          let addressStore = detail.main_delivery_address;
-          let siteName: string | undefined;
-
-          if (!addressText && detail.main_site_id) {
-            const site = await haloGet<{
-              name?: string;
-              delivery_address?: AddressStore;
-              invoice_address?: AddressStore;
-            }>(base, token, `/api/Site/${detail.main_site_id}?includeaddress=true`);
-            siteName = site.name || undefined;
-            addressText =
-              addressStoreToText(site.delivery_address) ||
-              addressStoreToText(site.invoice_address);
-            addressStore = site.delivery_address || site.invoice_address;
-          }
-
-          if (!addressText) {
-            addressText = customFieldAddress(detail.customfields);
-          }
-
-          return {
-            id: client.id,
-            name,
-            addressText: addressText || undefined,
-            addressStore,
-            siteName
-          } satisfies ClientAddressResult;
-        } catch {
-          return { id: client.id, name } satisfies ClientAddressResult;
-        }
-      })
-    );
-    results.push(...settled);
-  }
-
-  return results;
+function siteScore(site: HaloSite): number {
+  let score = 0;
+  if (site.defaultdelivery) score += 4;
+  if ((site.name || "").toLowerCase() === "main") score += 3;
+  if (site.delivery_address?.line1) score += 2;
+  else if (site.invoice_address?.line1) score += 1;
+  return score;
 }
 
 // --- Address helpers ---
@@ -396,46 +367,6 @@ function coordsFromStore(addr?: AddressStore | null): { lat: number; lng: number
   return { lat: addr.lat, lng: addr.long };
 }
 
-async function resolveCoords(
-  addressText: string,
-  store: AddressStore | undefined | null,
-  cache: Map<string, { lat: number; lng: number } | null>
-): Promise<{ lat: number; lng: number } | null> {
-  const fromStore = coordsFromStore(store);
-  if (fromStore) return fromStore;
-  return geocodeAddress(addressText, cache);
-}
-
-async function geocodeAddress(
-  address: string,
-  cache: Map<string, { lat: number; lng: number } | null>
-): Promise<{ lat: number; lng: number } | null> {
-  const key = address.trim().toLowerCase();
-  if (cache.has(key)) return cache.get(key) ?? null;
-
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address)}`;
-  const response = await fetch(url, {
-    headers: { "User-Agent": "HaloPSA-Client-Mapper/1.0 (Cloudflare Worker)" }
-  });
-
-  if (!response.ok) {
-    cache.set(key, null);
-    return null;
-  }
-
-  const results = (await response.json()) as Array<{ lat?: string; lon?: string }>;
-  const hit = results[0];
-  if (!hit?.lat || !hit.lon) {
-    cache.set(key, null);
-    return null;
-  }
-
-  const coords = { lat: parseFloat(hit.lat), lng: parseFloat(hit.lon) };
-  cache.set(key, coords);
-  await sleep(110);
-  return coords;
-}
-
 // --- Utilities ---
 
 function trimSlash(url: string): string {
@@ -461,10 +392,6 @@ function inferTenant(baseUrl: string): string | undefined {
     return undefined;
   }
   return undefined;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -580,7 +507,7 @@ function getPageHtml(title: string): string {
     <div class="stats" id="stats">Loading…</div>
   </header>
   <div id="map"></div>
-  <div id="status">Fetching Halo data and geocoding addresses…</div>
+  <div id="status">Fetching Halo data…</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
@@ -636,20 +563,62 @@ function getPageHtml(title: string): string {
         .replace(/"/g, "&quot;");
     }
 
-    function addMarkers(layer, points, kind, iconFn) {
+    const geocodeCache = new Map();
+
+    async function geocodeAddress(address) {
+      const key = address.trim().toLowerCase();
+      if (geocodeCache.has(key)) return geocodeCache.get(key);
+      const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
+        encodeURIComponent(address);
+      const res = await fetch(url, {
+        headers: { "User-Agent": "HaloPSA-Client-Mapper/1.0 (browser)" }
+      });
+      if (!res.ok) {
+        geocodeCache.set(key, null);
+        return null;
+      }
+      const hits = await res.json();
+      const hit = hits[0];
+      const coords = hit && hit.lat && hit.lon
+        ? { lat: parseFloat(hit.lat), lng: parseFloat(hit.lon) }
+        : null;
+      geocodeCache.set(key, coords);
+      await new Promise((r) => setTimeout(r, 200));
+      return coords;
+    }
+
+    async function resolvePoint(point) {
+      if (point.lat != null && point.lng != null) {
+        return { lat: point.lat, lng: point.lng };
+      }
+      return geocodeAddress(point.address);
+    }
+
+    async function addMarkers(layer, points, kind, iconFn, statusEl) {
       layer.clearLayers();
       const bounds = [];
+      let geocoded = 0;
+      let skipped = 0;
       for (const p of points) {
-        const m = L.marker([p.lat, p.lng], { icon: iconFn() });
+        const coords = await resolvePoint(p);
+        if (!coords) {
+          skipped++;
+          continue;
+        }
+        geocoded++;
+        const m = L.marker([coords.lat, coords.lng], { icon: iconFn() });
         m.bindTooltip(tooltipHtml(p, kind), {
           direction: "top",
           offset: [0, -8],
           opacity: 1
         });
         m.addTo(layer);
-        bounds.push([p.lat, p.lng]);
+        bounds.push([coords.lat, coords.lng]);
+        if (geocoded % 5 === 0) {
+          statusEl.textContent = "Placing " + kind.toLowerCase() + " pins… " + geocoded + " on map";
+        }
       }
-      return bounds;
+      return { bounds, geocoded, skipped };
     }
 
     function updateVisibility() {
@@ -670,15 +639,20 @@ function getPageHtml(title: string): string {
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
 
-        const agentBounds = addMarkers(agentLayer, data.agents, "Agent", agentIcon);
-        const orgBounds = addMarkers(orgLayer, data.organizations, "Organization", orgIcon);
-        const all = agentBounds.concat(orgBounds);
+        status.textContent = "Geocoding addresses in browser (keeps Worker fast)…";
+        const agentResult = await addMarkers(agentLayer, data.agents, "Agent", agentIcon, status);
+        const orgResult = await addMarkers(orgLayer, data.organizations, "Organization", orgIcon, status);
+        const all = agentResult.bounds.concat(orgResult.bounds);
         if (all.length) map.fitBounds(all, { padding: [40, 40], maxZoom: 12 });
 
+        const pinsOnMap = agentResult.geocoded + orgResult.geocoded;
+        const skipped = agentResult.skipped + orgResult.skipped;
         statsEl.textContent =
-          data.stats.agentsMapped + "/" + data.stats.agentsTotal + " agents · " +
-          data.stats.organizationsMapped + "/" + data.stats.organizationsTotal + " orgs on map";
-        status.textContent = "Ready. Hover pins for details. Zoom with scroll or +/- controls.";
+          agentResult.geocoded + "/" + data.stats.agentsMapped + " agents · " +
+          orgResult.geocoded + "/" + data.stats.organizationsMapped + " orgs on map";
+        status.textContent = pinsOnMap
+          ? "Ready — " + pinsOnMap + " pins" + (skipped ? " (" + skipped + " addresses could not be geocoded)" : "") + ". Hover for details."
+          : "No pins placed. Check that Halo has mailing addresses (agents) or site addresses (orgs).";
         status.classList.remove("error");
       } catch (e) {
         status.textContent = "Error: " + (e.message || e);
