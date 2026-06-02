@@ -261,11 +261,12 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
     log("info", `Using default agent address custom field id ${agentFieldId}`);
   }
 
-  const [agentsRaw, clientsRaw, sitesRaw] = await Promise.all([
+  const [agentsListed, clientsRaw, sitesRaw] = await Promise.all([
     fetchAllAgents(base, token, log, agentFieldId),
     fetchAllClients(base, token, log),
     fetchAllSites(base, token, log)
   ]);
+  const agentsRaw = await enrichAgentsWithAddresses(base, token, agentsListed, agentFieldId, log);
 
   const agents: MapPoint[] = [];
   let agentsWithAddress = 0;
@@ -559,6 +560,43 @@ async function fetchAllAgents(
   return filtered;
 }
 
+/** Halo list API omits custom field values; fetch detail only when mailing address is missing. */
+async function enrichAgentsWithAddresses(
+  base: string,
+  token: string,
+  agents: HaloAgent[],
+  fieldId: string,
+  log: (level: DebugLog["level"], message: string) => void
+): Promise<HaloAgent[]> {
+  const needsDetail = agents.filter((a) => !agentAddressText(a, fieldId));
+  if (needsDetail.length === 0) return agents;
+
+  log(
+    "info",
+    `Fetching ${needsDetail.length} agent detail(s) for custom field ${fieldId} (not on list API)`
+  );
+
+  const detailById = new Map<number, HaloAgent>();
+  const chunkSize = 5;
+  for (let i = 0; i < needsDetail.length; i += chunkSize) {
+    const chunk = needsDetail.slice(i, i + chunkSize);
+    await Promise.all(
+      chunk.map(async (agent) => {
+        const path = `/api/Agent/${agent.id}?includedetails=true&include_custom_fields=${encodeURIComponent(fieldId)}`;
+        const result = await haloGet(base, token, path);
+        if (!result.ok) {
+          log("warn", `GET ${path} → ${result.status}`);
+          return;
+        }
+        const detail = result.data as HaloAgent;
+        detailById.set(agent.id, { ...agent, ...detail, customfields: detail.customfields ?? agent.customfields });
+      })
+    );
+  }
+
+  return agents.map((agent) => detailById.get(agent.id) ?? agent);
+}
+
 function isActiveAgent(agent: HaloAgent): boolean {
   if (agent.name === "Unassigned") return false;
   if (agent.isdisabled) return false;
@@ -695,7 +733,7 @@ function buildOrganizations(
   if (noAddress > 0) {
     log(
       "warn",
-      `${noAddress} org(s) have no address (need site delivery_address or client custom field on list API)`
+      `${noAddress} org(s) have no address (check site delivery_address_line* in Halo)`
     );
   }
   log("info", `Organizations with address text: ${points.length}`);
