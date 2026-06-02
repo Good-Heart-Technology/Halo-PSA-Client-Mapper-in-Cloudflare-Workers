@@ -992,10 +992,65 @@ function getPageHtml(title: string): string {
       font-size: 0.95rem;
     }
     .toggle input { width: 18px; height: 18px; accent-color: #58a6ff; }
-    .stats {
+    .header-right {
       margin-left: auto;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
+      min-width: 220px;
+    }
+    .stats {
       font-size: 0.85rem;
       color: #8b949e;
+      text-align: right;
+    }
+    .load-progress {
+      width: 220px;
+    }
+    .load-progress.hidden { display: none; }
+    .load-progress-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .load-progress-label {
+      font-size: 0.75rem;
+      color: #8b949e;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 160px;
+    }
+    .load-progress-pct {
+      font-size: 0.75rem;
+      color: #58a6ff;
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+    }
+    .load-progress-track {
+      width: 100%;
+      height: 6px;
+      background: #30363d;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .load-progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #58a6ff, #3fb950);
+      border-radius: 3px;
+      transition: width 0.15s ease;
+    }
+    .load-progress.indeterminate .load-progress-bar {
+      width: 35%;
+      animation: load-indeterminate 1.1s ease-in-out infinite;
+    }
+    @keyframes load-indeterminate {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(320%); }
     }
     .tabs { display: flex; gap: 4px; }
     .tab {
@@ -1125,7 +1180,18 @@ function getPageHtml(title: string): string {
       <label class="toggle"><input type="checkbox" id="showAgents" checked /> Agents</label>
       <label class="toggle"><input type="checkbox" id="showOrgs" checked /> Organizations</label>
     </div>
-    <div class="stats" id="stats">Loading…</div>
+    <div class="header-right">
+      <div id="loadProgress" class="load-progress indeterminate">
+        <div class="load-progress-head">
+          <span class="load-progress-label" id="loadProgressLabel">Starting…</span>
+          <span class="load-progress-pct" id="loadProgressPct"></span>
+        </div>
+        <div class="load-progress-track">
+          <div class="load-progress-bar" id="loadProgressBar"></div>
+        </div>
+      </div>
+      <div class="stats" id="stats">Loading…</div>
+    </div>
   </header>
   <div id="mapPanel" class="panel active">
     <div id="map"></div>
@@ -1192,6 +1258,28 @@ function getPageHtml(title: string): string {
 
     const geocodeCache = new Map();
 
+    function setLoadProgress(percent, label, indeterminate) {
+      const wrap = document.getElementById("loadProgress");
+      const bar = document.getElementById("loadProgressBar");
+      const pctEl = document.getElementById("loadProgressPct");
+      const lbl = document.getElementById("loadProgressLabel");
+      wrap.classList.remove("hidden");
+      if (label) lbl.textContent = label;
+      if (indeterminate) {
+        wrap.classList.add("indeterminate");
+        pctEl.textContent = "";
+        return;
+      }
+      wrap.classList.remove("indeterminate");
+      const p = Math.max(0, Math.min(100, Math.round(percent)));
+      bar.style.width = p + "%";
+      pctEl.textContent = p + "%";
+    }
+
+    function hideLoadProgress() {
+      document.getElementById("loadProgress").classList.add("hidden");
+    }
+
     async function geocodeAddress(address) {
       const key = address.trim().toLowerCase();
       if (geocodeCache.has(key)) return geocodeCache.get(key);
@@ -1215,32 +1303,31 @@ function getPageHtml(title: string): string {
       return geocodeAddress(point.address);
     }
 
-    async function addMarkers(layer, points, kind, iconFn, statusEl) {
+    async function addMarkers(layer, points, kind, iconFn, onStep) {
       layer.clearLayers();
       const bounds = [];
       let geocoded = 0;
       let skipped = 0;
-      for (const p of points) {
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
         let coords = null;
         try {
           coords = await resolvePoint(p);
         } catch (_) {}
         if (!coords) {
           skipped++;
-          continue;
+        } else {
+          geocoded++;
+          const m = L.marker([coords.lat, coords.lng], { icon: iconFn() });
+          m.bindTooltip(tooltipHtml(p, kind), {
+            direction: "top",
+            offset: [0, -8],
+            opacity: 1
+          });
+          m.addTo(layer);
+          bounds.push([coords.lat, coords.lng]);
         }
-        geocoded++;
-        const m = L.marker([coords.lat, coords.lng], { icon: iconFn() });
-        m.bindTooltip(tooltipHtml(p, kind), {
-          direction: "top",
-          offset: [0, -8],
-          opacity: 1
-        });
-        m.addTo(layer);
-        bounds.push([coords.lat, coords.lng]);
-        if (geocoded % 5 === 0) {
-          statusEl.textContent = "Placing " + kind.toLowerCase() + " pins… " + geocoded + " on map";
-        }
+        if (onStep) onStep(i + 1, points.length, kind);
       }
       return { bounds, geocoded, skipped };
     }
@@ -1307,6 +1394,8 @@ function getPageHtml(title: string): string {
       const status = document.getElementById("status");
       const statsEl = document.getElementById("stats");
       try {
+        setLoadProgress(0, "Fetching Halo data…", true);
+        status.textContent = "Fetching Halo data…";
         const res = await fetch("/api/map-data");
         const data = await res.json();
         renderDebug(data.debug, data.configChecks);
@@ -1319,15 +1408,26 @@ function getPageHtml(title: string): string {
           s.sitesWithAddress + "/" + s.sitesTotal + " sites w/ address";
 
         if (!data.agents.length && !data.organizations.length) {
+          hideLoadProgress();
           status.textContent = "Halo returned no mappable addresses — open Debug tab for API details.";
           status.classList.add("error");
           showPanel("debugPanel");
           return;
         }
 
-        status.textContent = "Geocoding addresses (~1/sec, may take a minute)…";
-        const agentResult = await addMarkers(agentLayer, data.agents, "Agent", agentIcon, status);
-        const orgResult = await addMarkers(orgLayer, data.organizations, "Organization", orgIcon, status);
+        const totalPts = data.agents.length + data.organizations.length;
+        const geoPct = (done) => (totalPts ? 8 + Math.round((92 * done) / totalPts) : 100);
+        const onStep = (i, total, kind) => {
+          const global = kind === "Agent" ? i : data.agents.length + i;
+          setLoadProgress(geoPct(global), kind + " " + i + " / " + total, false);
+        };
+
+        setLoadProgress(8, "Geocoding addresses…", false);
+        status.textContent = "Geocoding addresses (~1/sec)…";
+        const agentResult = await addMarkers(agentLayer, data.agents, "Agent", agentIcon, onStep);
+        const orgResult = await addMarkers(orgLayer, data.organizations, "Organization", orgIcon, onStep);
+        setLoadProgress(100, "Complete", false);
+
         const all = agentResult.bounds.concat(orgResult.bounds);
         if (all.length) map.fitBounds(all, { padding: [40, 40], maxZoom: 12 });
 
@@ -1341,7 +1441,9 @@ function getPageHtml(title: string): string {
           ? "Ready — " + pinsOnMap + " pins" + (skipped ? " (" + skipped + " could not be geocoded)" : "") + ". Hover for details."
           : "Addresses found but geocoding failed — check Debug tab; Nominatim may be rate-limiting.";
         status.classList.remove("error");
+        hideLoadProgress();
       } catch (e) {
+        hideLoadProgress();
         status.textContent = "Error: " + (e.message || e);
         status.classList.add("error");
         statsEl.textContent = "";
