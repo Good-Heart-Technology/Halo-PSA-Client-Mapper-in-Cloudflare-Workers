@@ -9,11 +9,11 @@ preview_urls = false
 [vars]
 APP_NAME = "Halo Client & Agent Map"
 
-# Set via Cloudflare secrets (never commit real values):
+# Set via Cloudflare secrets:
 #   wrangler secret put HALO_CLIENT_ID
 #   wrangler secret put HALO_CLIENT_SECRET
 #   wrangler secret put HALO_BASE_URL
 # Optional tenant for hosted Halo (infer from URL host if omitted):
 #   wrangler secret put HALO_TENANT
-# Optional agent mailing-address custom field id (Halo PSA → custom field id):
+# Optional agent mailing-address custom field id (defaults to 297 if unset):
 #   wrangler secret put HALO_AGENT_ADDRESS_FIELD_ID

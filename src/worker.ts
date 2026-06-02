@@ -256,8 +256,13 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
 
   const token = await getHaloToken(env, log);
 
+  const agentFieldId = env.HALO_AGENT_ADDRESS_FIELD_ID?.trim() || DEFAULT_AGENT_ADDRESS_FIELD_ID;
+  if (!env.HALO_AGENT_ADDRESS_FIELD_ID?.trim()) {
+    log("info", `Using default agent address custom field id ${agentFieldId}`);
+  }
+
   const [agentsRaw, clientsRaw, sitesRaw] = await Promise.all([
-    fetchAllAgents(base, token, log, env),
+    fetchAllAgents(base, token, log, agentFieldId),
     fetchAllClients(base, token, log),
     fetchAllSites(base, token, log)
   ]);
@@ -266,7 +271,7 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
   let agentsWithAddress = 0;
   let agentsNoAddress = 0;
   for (const agent of agentsRaw) {
-    const addressText = agentAddressText(agent);
+    const addressText = agentAddressText(agent, agentFieldId);
     if (!addressText) {
       agentsNoAddress++;
       continue;
@@ -289,9 +294,8 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
   }
   log("info", `Agents with address text: ${agentsWithAddress} → ${agents.length} map entries`);
 
-  const sitesWithAddress = sitesRaw.filter(
-    (s) => addressStoreToText(s.delivery_address) || addressStoreToText(s.invoice_address)
-  ).length;
+  const sitesWithAddress = sitesRaw.filter((s) => siteAddressFromSite(s).text).length;
+  log("info", `Sites with parseable address: ${sitesWithAddress} of ${sitesRaw.length}`);
   const organizations = buildOrganizations(clientsRaw, sitesRaw, log);
 
   return {
@@ -418,11 +422,15 @@ interface HaloAgent {
 }
 
 interface HaloCustomField {
+  id?: number;
   name?: string;
   label?: string;
   type?: number;
   value?: string;
 }
+
+/** Default Halo custom field id for agent mailing address (override via HALO_AGENT_ADDRESS_FIELD_ID). */
+const DEFAULT_AGENT_ADDRESS_FIELD_ID = "297";
 
 interface HaloClient {
   id: number;
@@ -441,10 +449,20 @@ interface HaloSite {
   defaultdelivery?: boolean;
   delivery_address?: AddressStore;
   invoice_address?: AddressStore;
+  deladdress1?: string | null;
+  deladdress2?: string | null;
+  deladdress3?: string | null;
+  deladdress4?: string | null;
+  deladdress5?: string | null;
+  delivery_address_line1?: string | null;
+  delivery_address_line2?: string | null;
+  delivery_address_line3?: string | null;
+  delivery_address_line4?: string | null;
+  delivery_address_line5?: string | null;
 }
 
 const LIST_KEYS: Record<"Agent" | "Client" | "Site", string[]> = {
-  Agent: ["agents", "agent", "uname"],
+  Agent: ["results", "agents", "agent", "uname"],
   Client: ["clients", "client", "areas", "area"],
   Site: ["sites", "site"]
 };
@@ -499,34 +517,31 @@ async function fetchAllAgents(
   base: string,
   token: string,
   log: (level: DebugLog["level"], message: string) => void,
-  env: Env
+  agentFieldId: string
 ): Promise<HaloAgent[]> {
-  const params: Record<string, string> = {
-    activeinactive: "true,false",
+  const baseParams: Record<string, string> = {
     includedetails: "true",
-    pageinate: "true",
+    include_custom_fields: agentFieldId,
     page_size: "500",
     page_no: "1"
   };
-  if (env.HALO_AGENT_ADDRESS_FIELD_ID?.trim()) {
-    params.include_custom_fields = env.HALO_AGENT_ADDRESS_FIELD_ID.trim();
-    log("info", `Agent include_custom_fields=${params.include_custom_fields}`);
-  }
-  let list = await fetchHaloList<HaloAgent>(base, token, "Agent", params, log);
+  log("info", `Agent include_custom_fields=${agentFieldId}`);
+
+  let list = await fetchHaloList<HaloAgent>(
+    base,
+    token,
+    "Agent",
+    { ...baseParams, includeactive: "true", includeinactive: "false" },
+    log
+  );
 
   if (list.length === 0) {
-    log("warn", "Agent list empty — retrying with includeactive/includeinactive");
+    log("warn", "Agent list empty — retrying with activeinactive=true,false");
     list = await fetchHaloList<HaloAgent>(
       base,
       token,
       "Agent",
-      {
-        includeactive: "true",
-        includeinactive: "false",
-        includedetails: "true",
-        page_size: "500",
-        page_no: "1"
-      },
+      { ...baseParams, activeinactive: "true,false", pageinate: "true" },
       log
     );
   }
@@ -629,13 +644,17 @@ function buildOrganizations(
   for (const site of sites) {
     const clientId = site.client_id != null ? Math.round(site.client_id) : 0;
     if (!clientId) continue;
-    const store = site.delivery_address || site.invoice_address;
-    const text = addressStoreToText(store);
-    if (!text) continue;
-    const score = siteScore(site);
+    const parsed = siteAddressFromSite(site);
+    if (!parsed.text) continue;
+    const score = siteScore(site, parsed);
     const existing = sitePick.get(clientId);
     if (!existing || score > existing.score) {
-      sitePick.set(clientId, { score, siteName: site.name, text, store });
+      sitePick.set(clientId, {
+        score,
+        siteName: site.name,
+        text: parsed.text,
+        store: parsed.store
+      });
     }
   }
 
@@ -683,21 +702,63 @@ function buildOrganizations(
   return points;
 }
 
-function siteScore(site: HaloSite): number {
+function siteScore(site: HaloSite, parsed: { text: string }): number {
   let score = 0;
   if (site.defaultdelivery) score += 4;
   if ((site.name || "").toLowerCase() === "main") score += 3;
-  if (site.delivery_address?.line1) score += 2;
-  else if (site.invoice_address?.line1) score += 1;
+  if (parsed.text) score += 2;
   return score;
 }
 
 // --- Address helpers ---
 
-function agentAddressText(agent: HaloAgent): string | null {
+function siteAddressFromSite(site: HaloSite): { text: string | null; store?: AddressStore } {
+  const nested =
+    addressStoreToText(site.delivery_address) || addressStoreToText(site.invoice_address);
+  if (nested) {
+    return { text: nested, store: site.delivery_address || site.invoice_address };
+  }
+
+  const flatParts = [
+    site.deladdress1,
+    site.deladdress2,
+    site.deladdress3,
+    site.deladdress4,
+    site.deladdress5,
+    site.delivery_address_line1,
+    site.delivery_address_line2,
+    site.delivery_address_line3,
+    site.delivery_address_line4,
+    site.delivery_address_line5
+  ]
+    .map((p) => (p || "").trim())
+    .filter(Boolean);
+  if (flatParts.length) {
+    return { text: flatParts.join(", ") };
+  }
+
+  return { text: null };
+}
+
+function agentAddressText(agent: HaloAgent, fieldId: string): string | null {
+  const byId = customFieldById(agent.customfields, fieldId);
+  if (byId) return byId;
   const fromCustom = customFieldAddress(agent.customfields);
   if (fromCustom) return fromCustom;
   return addressStoreToText(agent.main_delivery_address);
+}
+
+function customFieldById(fields: HaloCustomField[] | undefined, fieldId: string): string | null {
+  if (!fields?.length || !fieldId) return null;
+  const want = fieldId.trim();
+  for (const field of fields) {
+    if (field.id != null && String(field.id) !== want) continue;
+    const value = (field.value || "").trim();
+    if (!value || value.startsWith("<")) continue;
+    if (field.type !== undefined && field.type !== 0) continue;
+    return value;
+  }
+  return null;
 }
 
 function customFieldAddress(fields?: HaloCustomField[]): string | null {
