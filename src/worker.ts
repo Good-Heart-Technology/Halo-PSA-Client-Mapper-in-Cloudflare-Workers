@@ -79,6 +79,13 @@ export default {
       }
     }
 
+    if (request.method === "GET" && url.pathname === "/api/geocode") {
+      const q = url.searchParams.get("q")?.trim();
+      if (!q) return jsonResponse(null, 400);
+      const coords = await geocodeAddressNominatim(q);
+      return jsonResponse(coords);
+    }
+
     if (request.method === "GET" && (url.pathname === "/api/halo-image" || url.pathname === "/api/agent-photo")) {
       const photoPath = url.searchParams.get("path");
       if (!photoPath || !isAllowedHaloImagePath(photoPath)) {
@@ -833,6 +840,40 @@ function coordsFromStore(addr?: AddressStore | null): { lat: number; lng: number
   return { lat: addr.lat, lng: addr.long };
 }
 
+async function geocodeAddressNominatim(address: string): Promise<{ lat: number; lng: number } | null> {
+  const cacheKey = new Request(
+    `https://halo-map.internal/geocode/v1/${encodeURIComponent(address.trim().toLowerCase())}`
+  );
+  const cached = await caches.default.match(cacheKey);
+  if (cached) {
+    const text = await cached.text();
+    if (!text || text === "null") return null;
+    return JSON.parse(text) as { lat: number; lng: number };
+  }
+
+  const url =
+    "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
+    encodeURIComponent(address);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "HaloPSA-Client-Mapper/1.0 (Cloudflare Worker)" }
+    });
+    const body = res.ok ? ((await res.json()) as Array<{ lat?: string; lon?: string }>) : [];
+    const hit = body[0];
+    const coords =
+      hit?.lat && hit?.lon ? { lat: parseFloat(hit.lat), lng: parseFloat(hit.lon) } : null;
+    await caches.default.put(
+      cacheKey,
+      new Response(coords ? JSON.stringify(coords) : "null", {
+        headers: { "Content-Type": "application/json", "Cache-Control": "max-age=86400" }
+      })
+    );
+    return coords;
+  } catch {
+    return null;
+  }
+}
+
 // --- Utilities ---
 
 function trimSlash(url: string): string {
@@ -1154,22 +1195,16 @@ function getPageHtml(title: string): string {
     async function geocodeAddress(address) {
       const key = address.trim().toLowerCase();
       if (geocodeCache.has(key)) return geocodeCache.get(key);
-      const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
-        encodeURIComponent(address);
-      const res = await fetch(url, {
-        headers: { "User-Agent": "HaloPSA-Client-Mapper/1.0 (browser)" }
-      });
-      if (!res.ok) {
-        geocodeCache.set(key, null);
-        return null;
-      }
-      const hits = await res.json();
-      const hit = hits[0];
-      const coords = hit && hit.lat && hit.lon
-        ? { lat: parseFloat(hit.lat), lng: parseFloat(hit.lon) }
-        : null;
+      let coords = null;
+      try {
+        const res = await fetch("/api/geocode?q=" + encodeURIComponent(address));
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.lat != null && data.lng != null) coords = data;
+        }
+      } catch (_) {}
       geocodeCache.set(key, coords);
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 1100));
       return coords;
     }
 
@@ -1186,7 +1221,10 @@ function getPageHtml(title: string): string {
       let geocoded = 0;
       let skipped = 0;
       for (const p of points) {
-        const coords = await resolvePoint(p);
+        let coords = null;
+        try {
+          coords = await resolvePoint(p);
+        } catch (_) {}
         if (!coords) {
           skipped++;
           continue;
@@ -1287,7 +1325,7 @@ function getPageHtml(title: string): string {
           return;
         }
 
-        status.textContent = "Geocoding addresses in browser (keeps Worker fast)…";
+        status.textContent = "Geocoding addresses (~1/sec, may take a minute)…";
         const agentResult = await addMarkers(agentLayer, data.agents, "Agent", agentIcon, status);
         const orgResult = await addMarkers(orgLayer, data.organizations, "Organization", orgIcon, status);
         const all = agentResult.bounds.concat(orgResult.bounds);
