@@ -34,6 +34,15 @@ interface DebugLog {
   message: string;
 }
 
+interface ConfigCheck {
+  key: string;
+  label: string;
+  required: boolean;
+  loaded: boolean;
+  ok: boolean;
+  detail: string;
+}
+
 interface MapDataResponse {
   agents: MapPoint[];
   organizations: MapPoint[];
@@ -46,6 +55,7 @@ interface MapDataResponse {
     sitesTotal: number;
     sitesWithAddress: number;
   };
+  configChecks: ConfigCheck[];
   debug: DebugLog[];
 }
 
@@ -65,7 +75,7 @@ export default {
         return jsonResponse(data);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
-        return jsonResponse(emptyMapDataResponse(message), 500);
+        return jsonResponse(emptyMapDataResponse(message, env), 500);
       }
     }
 
@@ -98,7 +108,8 @@ export default {
   }
 };
 
-function emptyMapDataResponse(errorMessage: string): MapDataResponse {
+function emptyMapDataResponse(errorMessage: string, env?: Env): MapDataResponse {
+  const { checks, logs } = env ? validateEnvConfig(env) : { checks: [] as ConfigCheck[], logs: [] as DebugLog[] };
   return {
     agents: [],
     organizations: [],
@@ -111,8 +122,99 @@ function emptyMapDataResponse(errorMessage: string): MapDataResponse {
       sitesTotal: 0,
       sitesWithAddress: 0
     },
-    debug: [{ at: new Date().toISOString(), level: "error", message: errorMessage }]
+    configChecks: checks,
+    debug: [
+      ...logs,
+      { at: new Date().toISOString(), level: "error", message: errorMessage }
+    ]
   };
+}
+
+function validateEnvConfig(env: Env): { checks: ConfigCheck[]; logs: DebugLog[] } {
+  const at = new Date().toISOString();
+  const checks: ConfigCheck[] = [
+    checkSecret("HALO_CLIENT_ID", "Halo Client ID", true, env.HALO_CLIENT_ID, (v) =>
+      v.length >= 8 ? null : "value too short"
+    ),
+    checkSecret("HALO_CLIENT_SECRET", "Halo Client Secret", true, env.HALO_CLIENT_SECRET, (v) =>
+      v.length >= 8 ? null : "value too short"
+    ),
+    checkSecret("HALO_BASE_URL", "Halo Base URL", true, env.HALO_BASE_URL, (v) => {
+      try {
+        const u = new URL(v);
+        if (u.protocol !== "https:") return "must use https://";
+        if (!u.hostname) return "missing hostname";
+        return null;
+      } catch {
+        return "not a valid URL";
+      }
+    }),
+    checkSecret("HALO_TENANT", "Halo Tenant", false, env.HALO_TENANT, (v) =>
+      /^[a-z0-9-]+$/i.test(v) ? null : "unexpected format"
+    ),
+    checkSecret(
+      "HALO_AGENT_ADDRESS_FIELD_ID",
+      "Agent address field ID",
+      false,
+      env.HALO_AGENT_ADDRESS_FIELD_ID,
+      (v) => (/^\d+$/.test(v) ? null : "should be numeric id")
+    ),
+    checkSecret("APP_NAME", "App name (var)", false, env.APP_NAME, () => null)
+  ];
+
+  const logs: DebugLog[] = checks.map((c) => ({
+    at,
+    level: c.ok ? "info" : c.required ? "error" : "warn",
+    message: `Config ${c.key}: ${c.ok ? "OK" : "FAIL"} — ${c.detail}`
+  }));
+
+  const missingRequired = checks.filter((c) => c.required && !c.ok).length;
+  logs.unshift({
+    at,
+    level: missingRequired ? "error" : "info",
+    message: missingRequired
+      ? `Config: ${missingRequired} required secret(s) missing or invalid`
+      : "Config: all required secrets loaded"
+  });
+
+  return { checks, logs };
+}
+
+function checkSecret(
+  key: string,
+  label: string,
+  required: boolean,
+  raw: string | undefined,
+  validate: (value: string) => string | null
+): ConfigCheck {
+  const value = (raw ?? "").trim();
+  const loaded = value.length > 0;
+  let detail = loaded ? "loaded" : "not set";
+  let valid = true;
+
+  if (loaded) {
+    const err = validate(value);
+    if (err) {
+      valid = false;
+      detail = `loaded — ${err}`;
+    } else if (key.includes("SECRET") || key.includes("CLIENT_ID")) {
+      detail = `loaded (${value.length} chars)`;
+    } else if (key === "HALO_BASE_URL") {
+      try {
+        detail = `loaded — ${new URL(value).host}`;
+      } catch {
+        detail = "loaded";
+      }
+    }
+  } else if (required) {
+    valid = false;
+    detail = "missing (required)";
+  } else {
+    detail = "not set (optional)";
+  }
+
+  const ok = required ? loaded && valid : !loaded || valid;
+  return { key, label, required, loaded, ok, detail };
 }
 
 function createDebugLog(): { logs: DebugLog[]; log: (level: DebugLog["level"], message: string) => void } {
@@ -127,6 +229,28 @@ function createDebugLog(): { logs: DebugLog[]; log: (level: DebugLog["level"], m
 
 async function buildMapData(env: Env): Promise<MapDataResponse> {
   const { logs, log } = createDebugLog();
+  const { checks: configChecks, logs: configLogs } = validateEnvConfig(env);
+  for (const line of configLogs) logs.push(line);
+
+  const missingRequired = configChecks.some((c) => c.required && !c.ok);
+  if (missingRequired) {
+    return {
+      agents: [],
+      organizations: [],
+      stats: {
+        agentsTotal: 0,
+        agentsMapped: 0,
+        agentsWithAddress: 0,
+        organizationsTotal: 0,
+        organizationsMapped: 0,
+        sitesTotal: 0,
+        sitesWithAddress: 0
+      },
+      configChecks,
+      debug: logs
+    };
+  }
+
   const base = trimSlash(env.HALO_BASE_URL);
   log("info", `Halo base URL host: ${safeHost(base)}`);
 
@@ -182,6 +306,7 @@ async function buildMapData(env: Env): Promise<MapDataResponse> {
       sitesTotal: sitesRaw.length,
       sitesWithAddress
     },
+    configChecks,
     debug: logs
   };
 }
@@ -717,6 +842,46 @@ function getPageHtml(title: string): string {
     .log-line.warn { color: #d29922; }
     .log-line.error { color: #f85149; }
     .log-time { color: #484f58; margin-right: 8px; }
+    #configChecks {
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #30363d;
+    }
+    #configChecks h2 {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #8b949e;
+      margin-bottom: 8px;
+      font-family: system-ui, sans-serif;
+    }
+    .cfg-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 4px;
+      font-family: system-ui, sans-serif;
+      font-size: 0.82rem;
+    }
+    .cfg-dot {
+      flex-shrink: 0;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-top: 4px;
+    }
+    .cfg-dot.ok { background: #3fb950; box-shadow: 0 0 6px #3fb95066; }
+    .cfg-dot.bad { background: #f85149; box-shadow: 0 0 6px #f8514966; }
+    .cfg-key { color: #e7ecf3; min-width: 220px; }
+    .cfg-key code { font-size: 0.78rem; color: #58a6ff; }
+    .cfg-meta { color: #8b949e; }
+    .cfg-badge {
+      font-size: 0.7rem;
+      padding: 1px 5px;
+      border-radius: 4px;
+      margin-left: 6px;
+      background: #30363d;
+      color: #8b949e;
+    }
     #status {
       padding: 8px 16px;
       font-size: 0.85rem;
@@ -777,7 +942,7 @@ function getPageHtml(title: string): string {
     <div id="map"></div>
   </div>
   <div id="debugPanelWrap" class="panel">
-    <pre id="debugPanel">No debug output yet. Load map data first.</pre>
+    <div id="debugPanel">No debug output yet. Load map data first.</div>
   </div>
   <div id="status">Fetching Halo data…</div>
 
@@ -921,18 +1086,34 @@ function getPageHtml(title: string): string {
       tab.addEventListener("click", () => showPanel(tab.getAttribute("data-panel")));
     });
 
-    function renderDebug(logs) {
-      const el = document.getElementById("debugPanel");
-      if (!logs || !logs.length) {
-        el.textContent = "No debug lines returned.";
-        return;
-      }
-      el.innerHTML = logs.map((line) => {
-        const t = line.at ? line.at.replace("T", " ").replace("Z", " UTC") : "";
-        return '<div class="log-line ' + escapeHtml(line.level) + '">' +
-          '<span class="log-time">' + escapeHtml(t) + "</span>" +
-          escapeHtml(line.message) + "</div>";
+    function renderConfigChecks(checks) {
+      if (!checks || !checks.length) return "";
+      const rows = checks.map((c) => {
+        const dot = c.ok ? "ok" : "bad";
+        const req = c.required
+          ? '<span class="cfg-badge">required</span>'
+          : '<span class="cfg-badge">optional</span>';
+        return '<div class="cfg-row">' +
+          '<span class="cfg-dot ' + dot + '" title="' + (c.ok ? "OK" : "FAIL") + '"></span>' +
+          '<span class="cfg-key"><code>' + escapeHtml(c.key) + "</code> " + escapeHtml(c.label) + req + "</span>" +
+          '<span class="cfg-meta">' + escapeHtml(c.detail) + "</span>" +
+          "</div>";
       }).join("");
+      return '<div id="configChecks"><h2>Worker secrets &amp; variables</h2>' + rows + "</div>";
+    }
+
+    function renderDebug(logs, configChecks) {
+      const el = document.getElementById("debugPanel");
+      const cfgHtml = renderConfigChecks(configChecks);
+      const logHtml = (!logs || !logs.length)
+        ? '<div class="log-line warn">No log lines returned.</div>'
+        : logs.map((line) => {
+            const t = line.at ? line.at.replace("T", " ").replace("Z", " UTC") : "";
+            return '<div class="log-line ' + escapeHtml(line.level) + '">' +
+              '<span class="log-time">' + escapeHtml(t) + "</span>" +
+              escapeHtml(line.message) + "</div>";
+          }).join("");
+      el.innerHTML = cfgHtml + (cfgHtml ? '<h2 style="font-size:0.85rem;color:#8b949e;margin:12px 0 8px;font-family:system-ui,sans-serif">Runtime log</h2>' : "") + logHtml;
     }
 
     async function load() {
@@ -941,7 +1122,7 @@ function getPageHtml(title: string): string {
       try {
         const res = await fetch("/api/map-data");
         const data = await res.json();
-        if (data.debug) renderDebug(data.debug);
+        renderDebug(data.debug, data.configChecks);
         if (!res.ok) throw new Error(data.error || res.statusText);
 
         const s = data.stats;
