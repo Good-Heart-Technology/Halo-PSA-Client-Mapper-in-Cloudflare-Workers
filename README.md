@@ -2,6 +2,8 @@
 
 A Cloudflare Worker that maps **Halo PSA agents** and **client organizations** on a dark-mode Leaflet map. Addresses come from Halo; geocoding runs in the browser via a Worker proxy to stay within Cloudflare limits.
 
+![Halo Client & Agent Map — organization tooltip with logo on the map](docs/screenshot.png)
+
 ## Features
 
 - **Interactive map** — Pan and zoom; the map fits all pins when loading completes.
@@ -49,27 +51,61 @@ Defined in `wrangler.toml` under `[vars]` or overridden in the dashboard:
 
 ## Custom domain (Cloudflare dashboard)
 
-This Worker is configured with `workers_dev = false`, so it is **not** served on `*.workers.dev`. Attach your own hostname:
+This Worker is configured with `workers_dev = false`, so it is **not** served on `*.workers.dev`. Publish it on your own hostname using either approach:
+
+- **Subdomain:** `https://map.yourdomain.com`
+- **Path on your site:** `https://yourdomain.com/halo-map/` (and routes under that path)
+
+### Subdomain (`map.yourdomain.com`)
 
 1. Open the [Cloudflare dashboard](https://dash.cloudflare.com) and select the account that owns the Worker.
 2. Go to **Workers & Pages** → **halo-psa-client-mapper** (or your deployed Worker name).
 3. Open **Settings** → **Domains & Routes** (or **Triggers** → **Custom Domains**, depending on the UI).
 4. Click **Add** / **Add Custom Domain**.
-5. Enter the hostname (e.g. `map.yourdomain.com`). The zone must be on the same Cloudflare account.
+5. Enter `map.yourdomain.com`. The zone must be on the same Cloudflare account.
 6. Confirm DNS — Cloudflare usually creates the required record automatically.
-7. Wait for SSL to become active, then open the custom URL. Routes on that hostname will hit this Worker.
+7. Wait for SSL to become active, then open the URL.
 
-For a path on an existing site (e.g. `yourdomain.com/halo-map/*`), use **Routes** instead and add a pattern that matches this Worker.
+### Path (`yourdomain.com/halo-map/`)
 
-## Deploy
+1. In the same Worker, go to **Settings** → **Triggers** → **Routes** (or **Domains & Routes** → **Routes**).
+2. Add a route such as `yourdomain.com/halo-map/*` (adjust the zone and path to match your site).
+3. Ensure your Worker serves the app at the root of that route (the map UI is at `/` on the Worker).
+
+## Security — Cloudflare Zero Trust
+
+This app reads Halo agent and client data. **We recommend protecting it with [Cloudflare Zero Trust](https://developers.cloudflare.com/cloudflare-one/)** so only authenticated users (your team, Google Workspace, etc.) can reach the hostname or route.
+
+Typical setup:
+
+1. In Zero Trust, create an **Application** for `map.yourdomain.com` or `yourdomain.com/halo-map`.
+2. Add an **Access policy** (e.g. allow your email domain or an identity provider group).
+3. Leave Halo API secrets on the Worker only — Zero Trust guards who can open the map; secrets still gate Halo API access.
+
+## Cloudflare Worker build configuration
+
+When connecting this repo to **Workers Builds** (GitHub/GitLab), use:
+
+| Setting | Value |
+|---------|--------|
+| **Build command** | `None` |
+| **Deploy command** | `npx wrangler deploy` |
+| **Version command** | `npx wrangler versions upload` |
+| **Root directory** | `/` |
+
+Set all required secrets on the Worker before the first deploy. The **Debug** tab in the app confirms whether each value is loaded (not the actual secret values).
+
+## Deploy (manual)
 
 ```bash
 npm install
 wrangler deploy
 ```
 
-Ensure all required secrets are set in the target environment before use. The **Debug** tab confirms whether each value is loaded (not the actual secret values).
-
 ## Repository
 
 [Good-Heart-Technology/Halo-PSA-Client-Mapper-in-Cloudflare-Workers](https://github.com/Good-Heart-Technology/Halo-PSA-Client-Mapper-in-Cloudflare-Workers)
+
+---
+
+**Good Heart Tech** is a 100% volunteer nonprofit that provides free IT services to other nonprofits. If you enjoy this product and want to support our work, please consider donating: [https://goodhearttech.org/](https://goodhearttech.org/)
