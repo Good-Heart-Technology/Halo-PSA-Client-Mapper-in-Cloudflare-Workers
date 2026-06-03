@@ -66,7 +66,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
-      return htmlResponse(getPageHtml(env.APP_NAME || "Halo Map"));
+      return htmlResponse(getPageHtml(env.APP_NAME || "Halo Client Mapper"));
     }
 
     if (request.method === "GET" && url.pathname === "/api/map-data") {
