@@ -992,6 +992,20 @@ function getPageHtml(title: string): string {
       font-size: 0.95rem;
     }
     .toggle input { width: 18px; height: 18px; accent-color: #58a6ff; }
+    .search-wrap { display: flex; align-items: center; }
+    .search-input {
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #e7ecf3;
+      font-size: 0.9rem;
+      padding: 6px 10px;
+      width: 220px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .search-input:focus { border-color: #58a6ff; }
+    .search-input::placeholder { color: #484f58; }
     .header-right {
       margin-left: auto;
       display: flex;
@@ -1180,6 +1194,15 @@ function getPageHtml(title: string): string {
       <label class="toggle"><input type="checkbox" id="showAgents" checked /> Agents</label>
       <label class="toggle"><input type="checkbox" id="showOrgs" checked /> Organizations</label>
     </div>
+    <div class="search-wrap map-only">
+      <input
+        type="search"
+        id="searchInput"
+        class="search-input"
+        placeholder="Search agents &amp; clients&hellip;"
+        autocomplete="off"
+      />
+    </div>
     <div class="header-right">
       <div id="loadProgress" class="load-progress indeterminate">
         <div class="load-progress-head">
@@ -1212,6 +1235,11 @@ function getPageHtml(title: string): string {
 
     const agentLayer = L.layerGroup().addTo(map);
     const orgLayer = L.layerGroup().addTo(map);
+
+    // Stored after geocoding so search/filter never re-geocodes
+    let agentMarkerData = [];
+    let orgMarkerData = [];
+    let markersLoaded = false;
 
     function agentIcon() {
       return L.divIcon({
@@ -1306,6 +1334,7 @@ function getPageHtml(title: string): string {
     async function addMarkers(layer, points, kind, iconFn, onStep) {
       layer.clearLayers();
       const bounds = [];
+      const markerData = [];
       let geocoded = 0;
       let skipped = 0;
       for (let i = 0; i < points.length; i++) {
@@ -1326,21 +1355,42 @@ function getPageHtml(title: string): string {
           });
           m.addTo(layer);
           bounds.push([coords.lat, coords.lng]);
+          markerData.push({ marker: m, point: p });
         }
         if (onStep) onStep(i + 1, points.length, kind);
       }
-      return { bounds, geocoded, skipped };
+      return { bounds, geocoded, skipped, markerData };
     }
 
-    function updateVisibility() {
+    // Single source of truth for visibility: respects both toggles and search term
+    function applyFilter() {
+      if (!markersLoaded) return;
+      const term = document.getElementById("searchInput").value.trim().toLowerCase();
       const showA = document.getElementById("showAgents").checked;
       const showO = document.getElementById("showOrgs").checked;
-      if (showA) map.addLayer(agentLayer); else map.removeLayer(agentLayer);
-      if (showO) map.addLayer(orgLayer); else map.removeLayer(orgLayer);
+
+      agentLayer.clearLayers();
+      orgLayer.clearLayers();
+
+      if (showA) {
+        for (const { marker, point } of agentMarkerData) {
+          if (!term || point.name.toLowerCase().includes(term) || point.address.toLowerCase().includes(term)) {
+            marker.addTo(agentLayer);
+          }
+        }
+      }
+      if (showO) {
+        for (const { marker, point } of orgMarkerData) {
+          if (!term || point.name.toLowerCase().includes(term) || point.address.toLowerCase().includes(term)) {
+            marker.addTo(orgLayer);
+          }
+        }
+      }
     }
 
-    document.getElementById("showAgents").addEventListener("change", updateVisibility);
-    document.getElementById("showOrgs").addEventListener("change", updateVisibility);
+    document.getElementById("showAgents").addEventListener("change", applyFilter);
+    document.getElementById("showOrgs").addEventListener("change", applyFilter);
+    document.getElementById("searchInput").addEventListener("input", applyFilter);
 
     function showPanel(panelId) {
       document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
@@ -1427,6 +1477,10 @@ function getPageHtml(title: string): string {
         const agentResult = await addMarkers(agentLayer, data.agents, "Agent", agentIcon, onStep);
         const orgResult = await addMarkers(orgLayer, data.organizations, "Organization", orgIcon, onStep);
         setLoadProgress(100, "Complete", false);
+
+        agentMarkerData = agentResult.markerData;
+        orgMarkerData = orgResult.markerData;
+        markersLoaded = true;
 
         const all = agentResult.bounds.concat(orgResult.bounds);
         if (all.length) map.fitBounds(all, { padding: [40, 40], maxZoom: 12 });
