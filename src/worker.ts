@@ -1171,6 +1171,26 @@ function getPageHtml(title: string): string {
       object-fit: contain;
       background: #fff;
     }
+    .tip-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .tip-btn {
+      flex: 1;
+      padding: 4px 8px;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      background: #30363d;
+      color: #e7ecf3;
+      font-size: 0.75rem;
+      cursor: pointer;
+      text-align: center;
+      text-decoration: none;
+      line-height: 1.4;
+      font-family: inherit;
+    }
+    .tip-btn:hover { background: #3d444d; border-color: #58a6ff; color: #58a6ff; }
     .agent-marker {
       background: #58a6ff;
       border: 2px solid #fff;
@@ -1271,12 +1291,19 @@ function getPageHtml(title: string): string {
       const site = point.siteName
         ? '<div class="tip-addr">' + escapeHtml(point.siteName) + "</div>"
         : "";
+      const mapsUrl = "https://www.google.com/maps/dir/?api=1&destination=" + encodeURIComponent(point.address);
+      const actions =
+        '<div class="tip-actions">' +
+        '<button class="tip-btn" onclick="navigator.clipboard.writeText(this.dataset.addr);this.textContent=\'✓\';setTimeout(()=>this.textContent=\'Copy\',1500)" data-addr="' + escapeHtml(point.address) + '">Copy</button>' +
+        '<a class="tip-btn" href="' + mapsUrl + '" target="_blank" rel="noopener">Directions</a>' +
+        '</div>';
       return (
         photo +
         '<div class="tip-title">' + escapeHtml(point.name) + "</div>" +
         '<div class="tip-addr">' + escapeHtml(kind) + "</div>" +
         site +
-        '<div class="tip-addr">' + escapeHtml(point.address) + "</div>"
+        '<div class="tip-addr">' + escapeHtml(point.address) + "</div>" +
+        actions
       );
     }
 
@@ -1357,7 +1384,8 @@ function getPageHtml(title: string): string {
           m.bindTooltip(tooltipHtml(p, kind), {
             direction: "top",
             offset: [0, -8],
-            opacity: 1
+            opacity: 1,
+            interactive: true
           });
           m.addTo(layer);
           bounds.push([coords.lat, coords.lng]);
