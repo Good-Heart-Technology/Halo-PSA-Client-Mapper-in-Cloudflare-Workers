@@ -1260,6 +1260,12 @@ function getPageHtml(title: string): string {
     const agentLayer = L.layerGroup().addTo(map);
     const orgLayer = L.layerGroup().addTo(map);
 
+    function copyAddress(btn) {
+      navigator.clipboard.writeText(btn.dataset.addr).catch(() => {});
+      btn.textContent = "✓";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    }
+
     // Stored after geocoding so search/filter never re-geocodes
     let agentMarkerData = [];
     let orgMarkerData = [];
@@ -1294,7 +1300,7 @@ function getPageHtml(title: string): string {
       const mapsUrl = "https://www.google.com/maps/dir/?api=1&destination=" + encodeURIComponent(point.address);
       const actions =
         '<div class="tip-actions">' +
-        '<button class="tip-btn" onclick="navigator.clipboard.writeText(this.dataset.addr);this.textContent=\'✓\';setTimeout(()=>this.textContent=\'Copy\',1500)" data-addr="' + escapeHtml(point.address) + '">Copy</button>' +
+        '<button class="tip-btn" onclick="copyAddress(this)" data-addr="' + escapeHtml(point.address) + '">Copy</button>' +
         '<a class="tip-btn" href="' + mapsUrl + '" target="_blank" rel="noopener">Directions</a>' +
         '</div>';
       return (
