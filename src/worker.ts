@@ -6,6 +6,7 @@ interface Env {
   /** Optional Halo custom field id for agent mailing address (include_custom_fields). */
   HALO_AGENT_ADDRESS_FIELD_ID?: string;
   APP_NAME?: string;
+  MAPBOX_KEY: string;
 }
 
 interface AddressStore {
@@ -82,7 +83,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/geocode") {
       const q = url.searchParams.get("q")?.trim();
       if (!q) return jsonResponse(null, 400);
-      const coords = await geocodeAddressNominatim(q);
+      const coords = await geocodeAddress(q, env.MAPBOX_KEY);
       return jsonResponse(coords);
     }
 
@@ -840,7 +841,7 @@ function coordsFromStore(addr?: AddressStore | null): { lat: number; lng: number
   return { lat: addr.lat, lng: addr.long };
 }
 
-async function geocodeAddressNominatim(address: string): Promise<{ lat: number; lng: number } | null> {
+async function geocodeAddress(address: string, mapboxKey: string): Promise<{ lat: number; lng: number } | null> {
   const cacheKey = new Request(
     `https://halo-map.internal/geocode/v1/${encodeURIComponent(address.trim().toLowerCase())}`
   );
@@ -852,16 +853,15 @@ async function geocodeAddressNominatim(address: string): Promise<{ lat: number; 
   }
 
   const url =
-    "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
-    encodeURIComponent(address);
+    "https://api.mapbox.com/geocoding/v5/mapbox.places/" +
+    encodeURIComponent(address) +
+    ".json?limit=1&access_token=" +
+    encodeURIComponent(mapboxKey);
   try {
-    const res = await fetch(url, {
-      headers: { "User-Agent": "HaloPSA-Client-Mapper/1.0 (Cloudflare Worker)" }
-    });
-    const body = res.ok ? ((await res.json()) as Array<{ lat?: string; lon?: string }>) : [];
-    const hit = body[0];
-    const coords =
-      hit?.lat && hit?.lon ? { lat: parseFloat(hit.lat), lng: parseFloat(hit.lon) } : null;
+    const res = await fetch(url);
+    const body = res.ok ? (await res.json()) as { features?: Array<{ center?: [number, number] }> } : {};
+    const center = body.features?.[0]?.center;
+    const coords = center ? { lat: center[1], lng: center[0] } : null;
     await caches.default.put(
       cacheKey,
       new Response(coords ? JSON.stringify(coords) : "null", {
@@ -1323,7 +1323,6 @@ function getPageHtml(title: string): string {
         }
       } catch (_) {}
       geocodeCache.set(key, coords);
-      await new Promise((r) => setTimeout(r, 1100));
       return coords;
     }
 
@@ -1340,12 +1339,15 @@ function getPageHtml(title: string): string {
       const markerData = [];
       let geocoded = 0;
       let skipped = 0;
+
+      // Geocode all points in parallel — Mapbox has no per-second rate limit
+      const coordsAll = await Promise.all(
+        points.map((p) => resolvePoint(p).catch(() => null))
+      );
+
       for (let i = 0; i < points.length; i++) {
         const p = points[i];
-        let coords = null;
-        try {
-          coords = await resolvePoint(p);
-        } catch (_) {}
+        const coords = coordsAll[i];
         if (!coords) {
           skipped++;
         } else {
@@ -1476,7 +1478,7 @@ function getPageHtml(title: string): string {
         };
 
         setLoadProgress(8, "Geocoding addresses…", false);
-        status.textContent = "Geocoding addresses (~1/sec)…";
+        status.textContent = "Geocoding addresses…";
         const agentResult = await addMarkers(agentLayer, data.agents, "Agent", agentIcon, onStep);
         const orgResult = await addMarkers(orgLayer, data.organizations, "Organization", orgIcon, onStep);
         setLoadProgress(100, "Complete", false);
