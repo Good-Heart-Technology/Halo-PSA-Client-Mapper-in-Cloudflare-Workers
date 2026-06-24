@@ -1150,10 +1150,12 @@ function getPageHtml(title: string): string {
       border-radius: 6px;
       padding: 8px 10px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      white-space: normal;
+      max-width: 240px;
     }
     .leaflet-tooltip::before { border-top-color: #30363d; }
     .tip-title { font-weight: 600; margin-bottom: 4px; }
-    .tip-addr { font-size: 0.8rem; color: #8b949e; max-width: 220px; }
+    .tip-addr { font-size: 0.8rem; color: #8b949e; overflow-wrap: break-word; }
     .tip-photo {
       width: 48px;
       height: 48px;
