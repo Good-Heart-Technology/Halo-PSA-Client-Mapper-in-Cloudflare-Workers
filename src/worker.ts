@@ -1152,7 +1152,8 @@ function getPageHtml(title: string): string {
       padding: 8px 10px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.4);
       white-space: normal;
-      max-width: 240px;
+      width: max-content;
+      max-width: 260px;
     }
     .leaflet-tooltip::before { border-top-color: #30363d; }
     .tip-title { font-weight: 600; margin-bottom: 4px; }
